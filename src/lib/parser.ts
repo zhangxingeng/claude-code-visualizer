@@ -1,0 +1,320 @@
+/**
+ * Parse Claude Code JSONL files into Entry objects.
+ * Pure TypeScript — no DOM, no Tauri, no Svelte.
+ */
+
+import type { ContentBlock, Entry } from './types.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Entry types that carry no conversational content — skip entirely. */
+const META_TYPES = new Set([
+  'mode',
+  'permission-mode',
+  'ai-title',
+  'file-history-snapshot',
+  'last-prompt',
+  'queue-operation',
+  'attachment',
+  'bridge-session',
+  'skill-listing',
+  'deferred-tools-delta',
+]);
+
+/** Prefixes that identify internal command echo messages — skip them. */
+const INTERNAL_ECHO_PREFIXES: string[] = [
+  '<command-name>',
+  '<local-command-stdout>',
+  '<command-message>',
+  '<command-args>',
+  '<local-command-caveat>',
+  '<system-reminder>',
+  '<teammate-message',
+  '<task-notification>',
+];
+
+// ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+type RawBlock = Record<string, unknown>;
+type RawEntry = Record<string, unknown>;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function isInternalEcho(content: unknown): boolean {
+  if (content == null) return false;
+  let text = '';
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content) && content.length >= 1) {
+    const first = content[0] as RawBlock;
+    if (first && first['type'] === 'text' && typeof first['text'] === 'string') {
+      text = first['text'];
+    }
+  }
+  return INTERNAL_ECHO_PREFIXES.some((p) => text.startsWith(p));
+}
+
+function parseTaskNotification(text: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const tags = [
+    'task-id', 'tool-use-id', 'output-file', 'status',
+    'summary', 'note', 'result',
+  ];
+  for (const tag of tags) {
+    const re = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+    const m = re.exec(text);
+    if (m) fields[tag.replace(/-/g, '_')] = m[1].trim();
+  }
+
+  // Usage stats
+  const usageParts: string[] = [];
+  for (const stat of ['subagent_tokens', 'tool_uses', 'duration_ms']) {
+    const re = new RegExp(`<${stat}>(\\d+)<\\/${stat}>`);
+    const m = re.exec(text);
+    if (m) usageParts.push(`${stat}: ${m[1]}`);
+  }
+  if (usageParts.length) fields['usage'] = usageParts.join(' | ');
+
+  return fields;
+}
+
+function extractContentBlocks(rawBlocks: RawBlock[]): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  for (const b of rawBlocks) {
+    if (typeof b !== 'object' || b === null) continue;
+    const type = b['type'] as string | undefined;
+
+    if (type === 'thinking') {
+      const thinking = (b['thinking'] as string) || '';
+      blocks.push({
+        blockType: 'thinking',
+        thinking,
+        signature: b['signature'] as string | undefined,
+        text: thinking,
+      });
+    } else if (type === 'text') {
+      blocks.push({
+        blockType: 'text',
+        text: (b['text'] as string) || '',
+      });
+    } else if (type === 'tool_use') {
+      blocks.push({
+        blockType: 'tool_use',
+        toolName: (b['name'] as string) || 'unknown',
+        toolId: (b['id'] as string) || '',
+        toolInput: (b['input'] as Record<string, unknown>) || {},
+      });
+    } else if (type === 'tool_result') {
+      const resultContent = b['content'];
+      const textParts: string[] = [];
+      if (Array.isArray(resultContent)) {
+        for (const item of resultContent as RawBlock[]) {
+          if (item && item['type'] === 'text' && typeof item['text'] === 'string') {
+            textParts.push(item['text']);
+          }
+        }
+      }
+      blocks.push({
+        blockType: 'tool_result',
+        toolId: (b['tool_use_id'] as string) || '',
+        toolOutput: textParts.join('\n'),
+        isError: !!(b['is_error'] as boolean),
+        text: textParts.join('\n'),
+      });
+    }
+  }
+  return blocks;
+}
+
+// ---------------------------------------------------------------------------
+// Primary export: parseJsonl
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse raw JSONL text into Entry objects.
+ * Filters meta entry types and internal command echoes.
+ * Detects interruptions and task-notification entries.
+ */
+export function parseJsonl(text: string): Entry[] {
+  const entries: Entry[] = [];
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let raw: RawEntry;
+    try {
+      raw = JSON.parse(trimmed) as RawEntry;
+    } catch {
+      continue;
+    }
+
+    const type = (raw['type'] as string) || '';
+
+    // Skip pure meta entry types
+    if (META_TYPES.has(type)) continue;
+
+    // Skip system entries (compact_boundary etc. carry no user-facing content)
+    if (type === 'system') continue;
+
+    const message = (raw['message'] as Record<string, unknown>) || {};
+    const contentRaw: unknown = message['content'];
+
+    // Parse content into blocks
+    let blocks: ContentBlock[] = [];
+    let isInterruption: boolean | undefined;
+    let taskNotification: Record<string, string> | undefined;
+
+    if (type === 'user') {
+      if (typeof contentRaw === 'string') {
+        if (contentRaw.startsWith('<task-notification>')) {
+          // Must be checked BEFORE echo filter — task-notification is a structured
+          // subagent result delivery, not a silent echo to drop.
+          taskNotification = parseTaskNotification(contentRaw);
+          // No content blocks — structured payload only
+        } else if (isInternalEcho(contentRaw)) {
+          // Drop internal command echoes (system-reminder, command-name, etc.)
+          continue;
+        } else if (contentRaw.includes('[Request interrupted by user]')) {
+          isInterruption = true;
+          blocks = [{ blockType: 'text', text: '[Request interrupted by user]' }];
+        } else {
+          blocks = [{ blockType: 'text', text: contentRaw }];
+        }
+      } else if (Array.isArray(contentRaw)) {
+        // Array content can also start with an echo prefix in its first text block
+        if (isInternalEcho(contentRaw)) continue;
+        blocks = extractContentBlocks(contentRaw as RawBlock[]);
+      }
+    } else if (type === 'assistant') {
+      if (Array.isArray(contentRaw)) {
+        blocks = extractContentBlocks(contentRaw as RawBlock[]);
+      }
+    }
+
+    entries.push({
+      type,
+      uuid: (raw['uuid'] as string) || '',
+      parentUuid: raw['parentUuid'] as string | undefined,
+      requestId: raw['requestId'] as string | undefined,
+      timestamp: raw['timestamp'] as string | undefined,
+      model: type === 'assistant' ? (message['model'] as string | undefined) : undefined,
+      isSidechain: (raw['isSidechain'] as boolean) || false,
+      blocks,
+      rawContent: contentRaw,
+      isInterruption,
+      taskNotification,
+      toolUseResult: raw['toolUseResult'] as Record<string, unknown> | undefined,
+    });
+  }
+
+  return entries;
+}
+
+// ---------------------------------------------------------------------------
+// extractMeta — used by the browse list (works on raw preview lines or Entries)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract session metadata (title, date, model) from either raw JSONL preview
+ * lines (string[]) or already-parsed Entry[].
+ *
+ * The browse list passes SessionMeta.preview (raw lines) so this must handle
+ * ai-title entries even though parseJsonl filters them.
+ */
+export function extractMeta(
+  preview: string[] | Entry[]
+): { title: string; date: string; model: string } {
+  let title = '';
+  let date = '';
+  let model = '';
+
+  if (preview.length === 0) return { title: 'Untitled', date, model };
+
+  if (typeof preview[0] === 'string') {
+    // Raw JSONL lines — parse without meta-type filtering to capture ai-title
+    for (const line of preview as string[]) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let raw: RawEntry;
+      try { raw = JSON.parse(trimmed) as RawEntry; } catch { continue; }
+
+      const type = (raw['type'] as string) || '';
+      const message = (raw['message'] as Record<string, unknown>) || {};
+      const content = message['content'];
+
+      if (type === 'ai-title' && !title) {
+        title = typeof content === 'string' ? content : '';
+      }
+      if (type === 'user' && !date) {
+        date = (raw['timestamp'] as string) || '';
+        if (!title) {
+          if (typeof content === 'string' && !isInternalEcho(content)) {
+            title = content;
+          } else if (Array.isArray(content) && content.length > 0) {
+            const first = content[0] as RawBlock;
+            if (first['type'] === 'text' && typeof first['text'] === 'string') {
+              title = first['text'];
+            }
+          }
+        }
+      }
+      if (type === 'assistant' && !model) {
+        model = (message['model'] as string) || '';
+      }
+      if (title && date && model) break;
+    }
+  } else {
+    // Already-parsed Entry[] — note: ai-title was filtered, so use first user turn
+    for (const e of preview as Entry[]) {
+      if (e.type === 'user' && !date) {
+        date = e.timestamp || '';
+        if (!title) {
+          const tb = e.blocks.find((b) => b.blockType === 'text');
+          if (tb?.text && !isInternalEcho(tb.text)) {
+            title = tb.text;
+          }
+        }
+      }
+      if (e.type === 'assistant' && !model) {
+        model = e.model || '';
+      }
+      if (title && date && model) break;
+    }
+  }
+
+  // Truncate long titles
+  if (title.length > 80) title = title.slice(0, 80) + '…';
+
+  return { title: title.trim() || 'Untitled', date, model };
+}
+
+// ---------------------------------------------------------------------------
+// decodeProject — human-readable project name from encoded dir name
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert an encoded Claude project directory name (e.g. "-home-user-myproject")
+ * to a human-readable string (e.g. "user/myproject").
+ */
+export function decodeProject(raw: string): string {
+  // Claude encodes paths: [^a-zA-Z0-9] → '-'
+  // Strip leading/trailing dashes, split on runs of dashes
+  const parts = raw.replace(/^-+|-+$/g, '').split(/-+/).filter(Boolean);
+  if (parts.length === 0) return raw;
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1];
+    const second = parts[parts.length - 2];
+    if (last.length > 3 && second.length > 2) {
+      return second + '/' + last;
+    }
+    return last;
+  }
+  return parts[0];
+}
