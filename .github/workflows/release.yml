@@ -7,6 +7,10 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build & attach to (e.g. v0.1.1)'
+        required: true
 
 permissions:
   contents: write
@@ -29,6 +33,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -66,9 +72,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Claude Code Visualizer ${{ github.ref_name }}'
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: 'Claude Code Visualizer ${{ github.event.inputs.tag || github.ref_name }}'
           releaseBody: 'Download the installer for your platform below. 100% offline — your chat history never leaves your machine. Unsigned builds: on first launch, Windows may show a SmartScreen prompt (More info → Run anyway) and macOS may require right-click → Open.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
